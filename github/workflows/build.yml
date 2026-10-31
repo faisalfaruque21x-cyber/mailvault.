@@ -1,0 +1,220 @@
+name: Build MailVault APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          P=app/src/main/java/com/mailvault
+          mkdir -p $P
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "MailVault"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          printf 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx2g\n' > gradle.properties
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.mailvault"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.mailvault"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.core:core-ktx:1.13.1") }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="MailVault" android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".MailListener" android:exported="true" android:label="MailVault"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter><action android:name="android.service.notification.NotificationListenerService"/></intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > $P/Db.kt <<'EOF'
+          package com.mailvault
+          import android.content.ContentValues
+          import android.content.Context
+          import android.database.sqlite.SQLiteDatabase
+          import android.database.sqlite.SQLiteOpenHelper
+          data class Mail(val t: Long, val sender: String, val subject: String, val body: String, val acct: String)
+          class Db(c: Context) : SQLiteOpenHelper(c.applicationContext, "mail.db", null, 1) {
+              override fun onCreate(d: SQLiteDatabase) {
+                  d.execSQL("CREATE TABLE mail(id INTEGER PRIMARY KEY, h TEXT UNIQUE, t INTEGER, sender TEXT, subject TEXT, body TEXT, acct TEXT)")
+              }
+              override fun onUpgrade(d: SQLiteDatabase, o: Int, n: Int) {}
+              fun add(m: Mail) {
+                  val v = ContentValues().apply {
+                      put("h", (m.sender + m.subject + m.body).hashCode().toString())
+                      put("t", m.t); put("sender", m.sender); put("subject", m.subject); put("body", m.body); put("acct", m.acct)
+                  }
+                  writableDatabase.insertWithOnConflict("mail", null, v, SQLiteDatabase.CONFLICT_IGNORE)
+              }
+              fun list(q: String = "", limit: Int = -1): List<Mail> {
+                  val like = "%" + q + "%"
+                  val c = readableDatabase.rawQuery(
+                      "SELECT t,sender,subject,body,acct FROM mail WHERE sender LIKE ? OR subject LIKE ? OR body LIKE ? ORDER BY t DESC" +
+                          (if (limit > 0) " LIMIT " + limit else ""), arrayOf(like, like, like))
+                  val out = ArrayList<Mail>()
+                  while (c.moveToNext()) out.add(Mail(c.getLong(0), c.getString(1), c.getString(2), c.getString(3), c.getString(4)))
+                  c.close(); return out
+              }
+          }
+          EOF
+          cat > $P/MailListener.kt <<'EOF'
+          package com.mailvault
+          import android.app.Notification
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          class MailListener : NotificationListenerService() {
+              override fun onListenerConnected() { activeNotifications?.forEach { save(it) } }
+              override fun onNotificationPosted(sbn: StatusBarNotification) { save(sbn) }
+              private fun save(s: StatusBarNotification) {
+                  if (s.packageName != "com.microsoft.office.outlook") return
+                  val n = s.notification
+                  if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+                  val e = n.extras
+                  val sender = e.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+                  val subject = e.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+                  val big = e.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString().orEmpty()
+                  val lines = e.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.joinToString("\n").orEmpty()
+                  val acct = e.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString().orEmpty()
+                  val body = listOf(big, lines, subject).maxByOrNull { it.length }.orEmpty()
+                  if (sender.isBlank() && body.isBlank()) return
+                  Db(this).add(Mail(s.postTime, sender, subject, body, acct))
+              }
+          }
+          EOF
+          cat > $P/MainActivity.kt <<'EOF'
+          package com.mailvault
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.widget.*
+          import androidx.core.app.NotificationManagerCompat
+          import java.text.DateFormat
+          import java.util.Date
+          class MainActivity : Activity() {
+              private lateinit var db: Db
+              private lateinit var status: TextView
+              private lateinit var listView: ListView
+              private lateinit var search: EditText
+              private var rows = listOf<Mail>()
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  db = Db(this)
+                  val pad = (14 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad * 2, pad, pad)
+                  status = TextView(this)
+                  status.textSize = 14f
+                  status.setTextColor(Color.DKGRAY)
+                  val bar = LinearLayout(this)
+                  fun btn(t: String, f: () -> Unit): Button {
+                      val x = Button(this)
+                      x.text = t
+                      x.setOnClickListener { f() }
+                      x.layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+                      return x
+                  }
+                  bar.addView(btn("Allow access") { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) })
+                  bar.addView(btn("Share with Claude") { share() })
+                  bar.addView(btn("Copy") { copy() })
+                  search = EditText(this)
+                  search.hint = "Search saved mail"
+                  search.isSingleLine = true
+                  search.addTextChangedListener(object : TextWatcher {
+                      override fun afterTextChanged(s: Editable?) { refresh() }
+                      override fun beforeTextChanged(s: CharSequence?, a: Int, c: Int, d: Int) {}
+                      override fun onTextChanged(s: CharSequence?, a: Int, c: Int, d: Int) {}
+                  })
+                  listView = ListView(this)
+                  listView.setOnItemClickListener { _, _, i, _ ->
+                      val m = rows[i]
+                      AlertDialog.Builder(this).setTitle(if (m.subject.isBlank()) m.sender else m.subject)
+                          .setMessage(m.sender + "\n" + m.acct + "\n" + fmt(m.t) + "\n\n" + m.body)
+                          .setPositiveButton("Close", null).show()
+                  }
+                  root.addView(status)
+                  root.addView(bar)
+                  root.addView(search)
+                  root.addView(listView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+                  setContentView(root)
+              }
+              override fun onResume() { super.onResume(); refresh() }
+              private fun fmt(t: Long): String = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(t))
+              private fun refresh() {
+                  val on = NotificationManagerCompat.getEnabledListenerPackages(this).contains(packageName)
+                  rows = db.list(search.text.toString().trim())
+                  status.text = if (on) "Saving Outlook mail - " + rows.size + " shown" else "Access is off. Tap Allow access and turn on MailVault."
+                  listView.adapter = object : ArrayAdapter<Mail>(this, android.R.layout.simple_list_item_2, rows) {
+                      override fun getView(i: Int, v: View?, p: ViewGroup): View {
+                          val view = super.getView(i, v, p)
+                          view.findViewById<TextView>(android.R.id.text1).text = rows[i].sender + "  -  " + fmt(rows[i].t)
+                          view.findViewById<TextView>(android.R.id.text2).text = rows[i].subject
+                          return view
+                      }
+                  }
+              }
+              private fun export(): String {
+                  val all = db.list(limit = 300)
+                  return "Outlook emails exported from MailVault (" + all.size + " latest)\n\n" + all.joinToString("\n\n") {
+                      "=== " + fmt(it.t) + "\nFrom: " + it.sender + "\nAccount: " + it.acct + "\nSubject: " + it.subject + "\n" + it.body
+                  }
+              }
+              private fun share() {
+                  val i = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, export())
+                  startActivity(Intent.createChooser(i, "Send to Claude"))
+              }
+              private fun copy() {
+                  (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("mail", export()))
+                  Toast.makeText(this, "Copied. Paste it into Claude.", Toast.LENGTH_SHORT).show()
+              }
+          }
+          EOF
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MailVault-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
